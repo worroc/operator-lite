@@ -1,0 +1,9 @@
+apiVersion: lite.example.com/v1alpha1
+kind: FireLite
+metadata:
+  name: example-firelite
+spec:
+  # Add fields here
+  size: 3
+  image: ealen/echo-server
+  port: 5111
