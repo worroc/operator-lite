@@ -7,3 +7,4 @@ spec:
   size: 3
   image: ealen/echo-server
   port: 5111
+  nickname: echoin
