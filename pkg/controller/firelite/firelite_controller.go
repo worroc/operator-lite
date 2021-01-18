@@ -2,6 +2,7 @@ package firelite
 
 import (
 	"context"
+	"fmt"
 
 	litev1alpha1 "github.com/worroc/operator-lite/pkg/apis/lite/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -55,7 +56,15 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 
 	// TODO(user): Modify this to be the types you create that are owned by the primary resource
 	// Watch for changes to secondary resource Pods and requeue the owner FireLite
-	err = c.Watch(&source.Kind{Type: &corev1.Pod{}}, &handler.EnqueueRequestForOwner{
+	err = c.Watch(&source.Kind{Type: &corev1.Service{}}, &handler.EnqueueRequestForOwner{
+		IsController: true,
+		OwnerType:    &litev1alpha1.FireLite{},
+	})
+	if err != nil {
+		return err
+	}
+
+	err = c.Watch(&source.Kind{Type: &appsv1.Deployment{}}, &handler.EnqueueRequestForOwner{
 		IsController: true,
 		OwnerType:    &litev1alpha1.FireLite{},
 	})
@@ -66,7 +75,7 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	return nil
 }
 
-// blank assignment to verify that ReconcileFireLite implements reconcile.Reconciler
+// blank assignment to verify that   implements reconcile.Reconciler
 var _ reconcile.Reconciler = &ReconcileFireLite{}
 
 // ReconcileFireLite reconciles a FireLite object
@@ -110,17 +119,19 @@ func (r *ReconcileFireLite) Reconcile(request reconcile.Request) (reconcile.Resu
 	err = r.client.Get(context.TODO(), types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, found)
 
 	var result *reconcile.Result
-	result, err = r.ensureDeployment(request, instance, r.backendDeployment(instance))
+
+	result, err = r.lineupService(request, instance, r.backendService(instance))
 	if result != nil {
 		return *result, err
 	}
 
-	result, err = r.ensureService(request, instance, r.backendService(instance))
+	result, err = r.lineupDeployment(request, instance, r.backendDeployment(instance))
 	if result != nil {
 		return *result, err
 	}
+
 	// Deployment and Service already exists - don't requeue
-	reqLogger.Info("Skip reconcile: Deployment and service already exists",
+	reqLogger.Info("Deployment and service lineup done",
 		"Deployment.Namespace", found.Namespace, "Deployment.Name", found.Name)
 	return reconcile.Result{}, nil
 
@@ -199,7 +210,8 @@ func (r *ReconcileFireLite) backendService(v *litev1alpha1.FireLite) *corev1.Ser
 				Protocol:   corev1.ProtocolTCP,
 				Port:       80,
 				TargetPort: intstr.FromInt(int(v.Spec.Port)),
-				NodePort:   30685,
+				// 30000-32767
+				NodePort: 30000 + (v.Spec.Port % 1000),
 			}},
 			Type: corev1.ServiceTypeNodePort,
 		},
@@ -236,9 +248,14 @@ func (r *ReconcileFireLite) backendDeployment(v *litev1alpha1.FireLite) *appsv1.
 						Image:           v.Spec.Image,
 						ImagePullPolicy: corev1.PullAlways,
 						Name:            nickName + "-pod",
+						Env: []corev1.EnvVar{{
+							Name:  "PORT",
+							Value: fmt.Sprintf("%d", port),
+						}},
 						Ports: []corev1.ContainerPort{{
 							ContainerPort: port,
 							Name:          nickName,
+							Protocol:      corev1.ProtocolTCP,
 						}},
 					}},
 				},
@@ -250,45 +267,82 @@ func (r *ReconcileFireLite) backendDeployment(v *litev1alpha1.FireLite) *appsv1.
 	return dep
 }
 
-func (r *ReconcileFireLite) ensureService(request reconcile.Request,
+func (r *ReconcileFireLite) lineupService(request reconcile.Request,
 	instance *litev1alpha1.FireLite,
 	s *corev1.Service,
 ) (*reconcile.Result, error) {
 
+	log.Info("harmonize Service")
+
 	// See if service already exists and create if it doesn't
-	found := &appsv1.Deployment{}
+	found := &corev1.Service{}
 	err := r.client.Get(context.TODO(), types.NamespacedName{
 		Name:      s.Name,
 		Namespace: instance.Namespace,
 	}, found)
+
+	log.Info("found", "value", found, "err", err)
 	if err != nil && errors.IsNotFound(err) {
-
-		// Create the service
-		log.Info("Creating a new Service", "Service.Namespace", s.Namespace, "Service.Name", s.Name)
-		err = r.client.Create(context.TODO(), s)
-
+		res, err := r.createService(s)
 		if err != nil {
-			// Service creation failed
-			log.Error(err, "Failed to create new Service", "Service.Namespace", s.Namespace, "Service.Name", s.Name)
-			return &reconcile.Result{}, err
-		} else {
-			// Service creation was successful
-			return nil, nil
+			return res, err
 		}
 	} else if err != nil {
 		// Error that isn't due to the service not existing
 		log.Error(err, "Failed to get Service")
 		return &reconcile.Result{}, err
+	} else {
+		// service exists lets check if we have to change it
+		log.Info("service",
+			"desired",
+			fmt.Sprintf("%d", s.Spec.Ports[0].NodePort),
+			"current",
+			fmt.Sprintf("%d", found.Spec.Ports[0].NodePort),
+		)
+		if s.Spec.Ports[0].NodePort != found.Spec.Ports[0].NodePort {
+			found.Spec.Ports[0].NodePort = s.Spec.Ports[0].NodePort
+			res, err := r.updateService(found)
+			if err != nil {
+				return res, err
+			}
+		}
 	}
 
 	return nil, nil
 }
 
-func (r *ReconcileFireLite) ensureDeployment(request reconcile.Request,
+func (r *ReconcileFireLite) createService(s *corev1.Service) (*reconcile.Result, error) {
+	// Create the service
+	log.Info("Creating a new Service", "Service.Namespace", s.Namespace, "Service.Name", s.Name)
+	err := r.client.Create(context.TODO(), s)
+
+	if err != nil {
+		// Service creation failed
+		log.Error(err, "Failed to create new Service", "Service.Namespace", s.Namespace, "Service.Name", s.Name)
+		return &reconcile.Result{}, err
+	}
+	// Service creation was successful
+	return nil, nil
+}
+func (r *ReconcileFireLite) updateService(s *corev1.Service) (*reconcile.Result, error) {
+	// Create the service
+	log.Info("Updating a Service", "Service.Namespace", s.Namespace, "Service.Name", s.Name)
+	err := r.client.Update(context.TODO(), s)
+
+	if err != nil {
+		// Service creation failed
+		log.Error(err, "Failed to update Service", "Service.Namespace", s.Namespace, "Service.Name", s.Name)
+		return &reconcile.Result{}, err
+	}
+	// Service updates was successfuly
+	return nil, nil
+}
+
+func (r *ReconcileFireLite) lineupDeployment(request reconcile.Request,
 	instance *litev1alpha1.FireLite,
 	dep *appsv1.Deployment,
 ) (*reconcile.Result, error) {
-
+	log.Info("lineup Deployment")
 	// See if deployment already exists and create if it doesn't
 	found := &appsv1.Deployment{}
 	err := r.client.Get(context.TODO(), types.NamespacedName{
@@ -296,24 +350,51 @@ func (r *ReconcileFireLite) ensureDeployment(request reconcile.Request,
 		Namespace: instance.Namespace,
 	}, found)
 	if err != nil && errors.IsNotFound(err) {
-
-		// Create the deployment
-		log.Info("Creating a new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
-		err = r.client.Create(context.TODO(), dep)
-
+		res, err := r.createDeployment(dep)
 		if err != nil {
-			// Deployment failed
-			log.Error(err, "Failed to create new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
-			return &reconcile.Result{}, err
-		} else {
-			// Deployment was successful
-			return nil, nil
+			return res, err
 		}
 	} else if err != nil {
 		// Error that isn't due to the deployment not existing
 		log.Error(err, "Failed to get Deployment")
 		return &reconcile.Result{}, err
+	} else {
+		replicas := instance.Spec.Size
+		found.Spec.Replicas = &replicas
+		found.Spec.Template.Spec.Containers[0].Ports[0].ContainerPort = instance.Spec.Port
+		found.Spec.Template.Spec.Containers[0].Image = instance.Spec.Image
+		found.Spec.Template.Spec.Containers[0].Env[0].Value = fmt.Sprintf("%d", instance.Spec.Port)
+		res, err := r.updateDeployment(found)
+		if err != nil {
+			return res, err
+		}
 	}
 
+	return nil, nil
+}
+func (r *ReconcileFireLite) createDeployment(
+	dep *appsv1.Deployment,
+) (*reconcile.Result, error) {
+
+	// Create the deployment
+	log.Info("Creating a new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
+	err := r.client.Create(context.TODO(), dep)
+
+	if err != nil {
+		// Deployment failed
+		log.Error(err, "Failed to create new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
+		return &reconcile.Result{}, err
+	}
+	// Deployment was successful
+	return nil, nil
+}
+
+func (r *ReconcileFireLite) updateDeployment(
+	dep *appsv1.Deployment,
+) (*reconcile.Result, error) {
+	err := r.client.Update(context.TODO(), dep)
+	if err != nil {
+		return &reconcile.Result{}, err
+	}
 	return nil, nil
 }
